@@ -5,31 +5,40 @@
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSans12pt7b.h>
 #include <WiFi.h>
-#include <driver/i2s.h>
 #include <WiFiManager.h>
+#include <driver/i2s.h>
 #include <DHT.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
+#include <AudioFileSourceHTTPSStream.h>
 
-// --- Định nghĩa chân I2S Micro (INMP441) ---
+// --- THAY BẰNG LINK CLOUDFLARE CỦA BẠN ---
+const char* SERVER_URL = "https://groq-ai.thaihuy1112006.workers.dev";
+
+// --- Chân I2S Micro (INMP441) ---
 #define I2S_MIC_PORT I2S_NUM_0
 #define I2S_MIC_SCK  4
 #define I2S_MIC_WS   5
 #define I2S_MIC_SD   6
 
-// --- Định nghĩa chân I2S Loa (MAX98357) ---
+// --- Chân I2S Loa (MAX98357) ---
+#define I2S_SPK_PORT I2S_NUM_1
 #define I2S_SPK_BCLK 15
 #define I2S_SPK_LRC  16
 #define I2S_SPK_DIN  17
 
-// --- Định nghĩa chân cảm biến ---
+// --- Chân cảm biến ---
 #define DHTPIN 7
 #define DHTTYPE DHT11
 DHT dht(DHTPIN, DHTTYPE);
 #define TOUCH_PIN 14
 #define POT_PIN 10 // Biến trở 20k
 
-// --- Định nghĩa chân cắm màn hình ---
+// --- Chân cắm màn hình ---
 #define TFT_MOSI 11
 #define TFT_SCLK 12
 #define TFT_CS   -1 
@@ -39,11 +48,10 @@ DHT dht(DHTPIN, DHTTYPE);
 SPIClass fspi(FSPI);
 Adafruit_ST7789 tft = Adafruit_ST7789(&fspi, TFT_CS, TFT_DC, TFT_RST);
 
-// --- Màu sắc Giao diện ---
-#define COLOR_BG       0x0000  // Đen tuyền
-#define COLOR_EYE      0x07FF  // Xanh Cyan
-#define COLOR_USER_BUB 0x03E0  // Xanh lá đậm (ít dùng)
-#define COLOR_AI_BUB   0x18E3  // Xám đen (Dark Gray)
+#define COLOR_BG       0x0000 
+#define COLOR_EYE      0x07FF 
+#define COLOR_USER_BUB 0x03E0 
+#define COLOR_AI_BUB   0x18E3 
 #define COLOR_WHITE    0xFFFF
 #define COLOR_YELLOW   0xFFE0
 
@@ -60,13 +68,91 @@ float currentHum = 0.0;
 unsigned long lastDhtTime = 0;
 bool forceUIUpdate = true;
 
-// Các hàm vẽ giao diện 
+// Bộ nhớ Audio PSRAM
+const int MAX_RECORD_TIME_SEC = 6;
+const int SAMPLE_RATE = 16000;
+const int MAX_AUDIO_BYTES = SAMPLE_RATE * 2 * MAX_RECORD_TIME_SEC + 44; 
+uint8_t* audioBuffer;
+int audioLength = 0;
+
+AudioGeneratorMP3 *mp3;
+AudioOutputI2S *out;
+AudioFileSourceHTTPSStream *fileStream;
+
 void printText(const char* text, int x, int y, uint16_t color, const GFXfont* font) {
   tft.setFont(font);
   tft.setTextColor(color);
   tft.setCursor(x, y);
   tft.setTextWrap(false);
   tft.print(text);
+}
+
+int getMultilineTextHeight(const char* text, const GFXfont* font, int maxWidth) {
+  tft.setFont(font);
+  String str(text); String word = ""; String line = ""; int lines = 1;
+  for (int i = 0; i <= (int)str.length(); i++) {
+    char c = (i < str.length()) ? str[i] : ' ';
+    if (c == ' ' || c == '\n' || i == str.length()) {
+      int16_t x1, y1; uint16_t w, h;
+      tft.getTextBounds(line + word, 0, 0, &x1, &y1, &w, &h);
+      if (w > maxWidth && line.length() > 0) { lines++; line = word + " "; } 
+      else { line += word + " "; }
+      word = "";
+      if (c == '\n') { lines++; line = ""; }
+    } else { word += c; }
+  }
+  return lines * 20;
+}
+
+void printMultilineText(const char* text, int x, int y, uint16_t color, const GFXfont* font, int maxWidth, int maxY = 240) {
+  tft.setFont(font);
+  tft.setTextColor(color);
+  String str(text); String word = ""; String line = ""; int currentY = y;
+  for (int i = 0; i <= (int)str.length(); i++) {
+    char c = (i < (int)str.length()) ? str[i] : ' ';
+    if (c == ' ' || c == '\n' || i == str.length()) {
+      int16_t x1, y1; uint16_t w, h;
+      tft.getTextBounds(line + word, x, currentY, &x1, &y1, &w, &h);
+      if (w > maxWidth && line.length() > 0) {
+        if (currentY > maxY) return; 
+        tft.setCursor(x, currentY); tft.print(line);
+        currentY += 20; line = word + " ";
+      } else { line += word + " "; }
+      word = "";
+      if (c == '\n') {
+        if (currentY > maxY) return;
+        tft.setCursor(x, currentY); tft.print(line);
+        currentY += 20; line = "";
+      }
+    } else { word += c; }
+  }
+  if (currentY <= maxY) { tft.setCursor(x, currentY); tft.print(line); }
+}
+
+void drawChatUI(const char* userText, const char* aiText) {
+  tft.fillScreen(COLOR_BG);
+  int currentY = 10;
+  
+  if (strlen(userText) > 0) {
+    int textH = getMultilineTextHeight(userText, &FreeSans9pt7b, 180);
+    int bubH = textH + 30;
+    if (bubH > 100) bubH = 100; 
+    tft.fillRoundRect(30, currentY, 200, bubH, 10, COLOR_USER_BUB);
+    tft.fillTriangle(220, currentY + 15, 220, currentY + 30, 235, currentY + 22, COLOR_USER_BUB);
+    printText("Tui: ", 40, currentY + 18, COLOR_WHITE, &FreeSans9pt7b);
+    printMultilineText(userText, 40, currentY + 38, COLOR_WHITE, &FreeSans9pt7b, 180, currentY + bubH - 5);
+    currentY += bubH + 10;
+  }
+  
+  if (strlen(aiText) > 0) {
+    int textH = getMultilineTextHeight(aiText, &FreeSans9pt7b, 200);
+    int bubH = textH + 30; 
+    if (currentY + bubH > 235) bubH = 235 - currentY; 
+    tft.fillRoundRect(10, currentY, 220, bubH, 10, COLOR_AI_BUB);
+    tft.fillTriangle(20, currentY + 15, 20, currentY + 30, 5, currentY + 22, COLOR_AI_BUB);
+    printText("AI: ", 20, currentY + 18, COLOR_EYE, &FreeSans9pt7b);
+    printMultilineText(aiText, 20, currentY + 38, COLOR_WHITE, &FreeSans9pt7b, 200, currentY + bubH - 5);
+  }
 }
 
 void drawEyes() {
@@ -78,132 +164,73 @@ void drawEyes() {
   static unsigned long blinkTime = 0;
   static int lastPrintedMinute = -1;
 
-  static float lastPrintedTemp = -999.0;
-  static float lastPrintedHum = -999.0;
-  bool isPanelRedrawNeeded = false;
-
   if (forceUIUpdate) {
     needsRedraw = true;
-    isPanelRedrawNeeded = true;
     lastPrintedMinute = -1;
     tft.fillScreen(COLOR_BG);
     forceUIUpdate = false;
   }
 
-  // Xử lý nháy mắt (Mắt nhắm lại rồi mở ra sau 150ms)
   if (isBlinking && millis() - blinkTime > 150) {
-    isBlinking = false;
-    currentH = 60;
-    needsRedraw = true;
+    isBlinking = false; currentH = 60; needsRedraw = true;
   }
-
-  // Cứ mỗi 1.5 - 3 giây sẽ random làm 1 hành động
   if (!isBlinking && millis() - lastActionTime > random(1500, 3000)) {
     lastActionTime = millis();
     int action = random(100);
-    
-    if (action < 40) {
-      isBlinking = true;
-      blinkTime = millis();
-      currentH = 10;
-    } else if (action < 60) {
-      currentX = 30; // Liếc trái
-    } else if (action < 80) {
-      currentX = 70; // Liếc phải
-    } else {
-      currentX = 50; // Nhìn thẳng
-    }
+    if (action < 40) { isBlinking = true; blinkTime = millis(); currentH = 10; } 
+    else if (action < 60) { currentX = 30; } 
+    else if (action < 80) { currentX = 70; } 
+    else { currentX = 50; }
     needsRedraw = true;
   }
 
-  // Cập nhật DHT
   if (millis() - lastDhtTime > 5000) {
     lastDhtTime = millis();
     float t = dht.readTemperature();
     float h = dht.readHumidity();
     if (!isnan(t) && !isnan(h)) {
-      if (t != currentTemp || h != currentHum) {
-         currentTemp = t;
-         currentHum = h;
-      }
+      currentTemp = t; currentHum = h;
     }
   }
-  
-  if (currentTemp != lastPrintedTemp || currentHum != lastPrintedHum) {
-      isPanelRedrawNeeded = true;
-  }
 
-  // Vẽ mắt (chỉ xóa cục bộ khu vực mắt để không giật panel)
   if (needsRedraw) {
-    tft.fillRect(0, 0, 240, 140, COLOR_BG); // Xóa nửa trên
+    tft.fillRect(0, 0, 240, 140, COLOR_BG); 
     tft.fillRoundRect(currentX, 70 - (currentH/2), 50, currentH, 15, COLOR_EYE);
     tft.fillRoundRect(currentX + 90, 70 - (currentH/2), 50, currentH, 15, COLOR_EYE);
     needsRedraw = false;
   }
 
-  // Đồng hồ & Panel
   struct tm timeinfo;
   bool gotTime = getLocalTime(&timeinfo, 0);
-  if (gotTime && (timeinfo.tm_min != lastPrintedMinute || forceUIUpdate)) {
-      isPanelRedrawNeeded = true;
-  }
-
-  // Vẽ Panel thông tin kết hợp
-  if (isPanelRedrawNeeded && currentTemp > 0.0) {
-    lastPrintedTemp = currentTemp;
-    lastPrintedHum = currentHum;
-    if (gotTime) lastPrintedMinute = timeinfo.tm_min;
-    
+  if (currentTemp > 0.0) {
     tft.fillRect(70, 0, 100, 30, COLOR_BG);
-    
-    // Nền panel (Xám đậm)
     tft.fillRoundRect(10, 145, 220, 85, 12, 0x2104);
-    
     if (gotTime) {
-      char timeStr[10];
-      strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
-      tft.setFont(&FreeSans12pt7b);
-      tft.setTextColor(0xFFFF);
-      tft.setCursor(85, 175); 
-      tft.print(timeStr);
+      char timeStr[10]; strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+      tft.setFont(&FreeSans12pt7b); tft.setTextColor(0xFFFF);
+      tft.setCursor(85, 175); tft.print(timeStr);
     }
-    
     tft.setFont(&FreeSans9pt7b);
-    
-    // Nhiệt độ bên trái
     tft.fillCircle(25, 210, 7, 0xF800); 
     tft.fillRoundRect(22, 193, 7, 17, 3, 0xF800); 
-    tft.setTextColor(0xFFE0); 
-    tft.setCursor(40, 215);
-    tft.printf("%.1f C", currentTemp);
+    tft.setTextColor(0xFFE0); tft.setCursor(40, 215); tft.printf("%.1f C", currentTemp);
 
-    // Độ ẩm bên phải
     tft.fillCircle(135, 210, 7, 0x051D); 
     tft.fillTriangle(128, 210, 142, 210, 135, 196, 0x051D);
-    tft.setTextColor(0x07E0); 
-    tft.setCursor(150, 215);
-    tft.printf("%.1f %%", currentHum);
+    tft.setTextColor(0x07E0); tft.setCursor(150, 215); tft.printf("%.1f %%", currentHum);
   }
 }
 
 void drawEQBars(int energy) {
     static const uint16_t EQ_COLORS[24] = {
-      0xF800, 0xF800, 0xF804, 0xF808, 
-      0xF80C, 0xF810, 0xF814, 0xF818, 
-      0xF81C, 0xF81F, 0xD81F, 0xB81F, 
-      0x981F, 0x781F, 0x581F, 0x381F, 
-      0x181F, 0x001F, 0x01FF, 0x03FF, 
-      0x05FF, 0x07FF, 0x07FF, 0x07FF  
+      0xF800, 0xF800, 0xF804, 0xF808, 0xF80C, 0xF810, 0xF814, 0xF818, 
+      0xF81C, 0xF81F, 0xD81F, 0xB81F, 0x981F, 0x781F, 0x581F, 0x381F, 
+      0x181F, 0x001F, 0x01FF, 0x03FF, 0x05FF, 0x07FF, 0x07FF, 0x07FF  
     };
-    
-    static float phase = 0;
-    phase += 0.4;
-    
+    static float phase = 0; phase += 0.4;
     static int old_bar_height[24] = {0};
-    
-    int max_amp = map(energy, 0, 5000, 5, 80);
-    if (max_amp > 80) max_amp = 80;
-    if (max_amp < 5) max_amp = 5;
+    int max_amp = map(energy, 0, 20000, 5, 80);
+    if (max_amp > 80) max_amp = 80; if (max_amp < 5) max_amp = 5;
 
     for (int i = 0; i < 24; i++) {
         float wave = abs(sin(i * 0.5 + phase) * cos(i * 0.3 - phase * 0.7));
@@ -214,20 +241,30 @@ void drawEQBars(int energy) {
         if (target_h > 80) target_h = 80;
         
         int h = old_bar_height[i];
+        if (target_h > h) h = target_h; else { h -= 4; if (h < 5) h = 5; }
         
-        if (target_h > h) h = target_h;
-        else { h -= 4; if (h < 5) h = 5; }
-        
-        int x = i * 10 + 1; 
-        int old_h = old_bar_height[i];
-        
+        int x = i * 10 + 1; int old_h = old_bar_height[i];
         if (h < old_h) tft.fillRect(x, 230 - old_h, 8, old_h - h, COLOR_BG);
         else if (h > old_h) tft.fillRect(x, 230 - h, 8, h - old_h, EQ_COLORS[i]);
-        
         if (old_h == 0) tft.fillRect(x, 230 - 5, 8, 5, EQ_COLORS[i]); 
         
         old_bar_height[i] = h;
     }
+}
+
+void createWavHeader(byte* header, int waveDataSize){
+  header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+  unsigned int fileSize = waveDataSize + 36;
+  header[4] = (byte)(fileSize & 0xFF); header[5] = (byte)((fileSize >> 8) & 0xFF); header[6] = (byte)((fileSize >> 16) & 0xFF); header[7] = (byte)((fileSize >> 24) & 0xFF);
+  header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+  header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+  header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
+  header[20] = 1; header[21] = 0; header[22] = 1; header[23] = 0;
+  header[24] = 0x80; header[25] = 0x3E; header[26] = 0x00; header[27] = 0x00; 
+  header[28] = 0x00; header[29] = 0x7D; header[30] = 0x00; header[31] = 0x00; 
+  header[32] = 2; header[33] = 0; header[34] = 16; header[35] = 0;
+  header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+  header[40] = (byte)(waveDataSize & 0xFF); header[41] = (byte)((waveDataSize >> 8) & 0xFF); header[42] = (byte)((waveDataSize >> 16) & 0xFF); header[43] = (byte)((waveDataSize >> 24) & 0xFF);
 }
 
 void setup() {
@@ -236,16 +273,62 @@ void setup() {
   pinMode(TOUCH_PIN, INPUT);
   pinMode(POT_PIN, INPUT);
 
-  // KHỞI TẠO SPI TRƯỚC THEO QUY TẮC CỦA LƯU Ý
+  // Cấp phát PSRAM (ESP32-S3 N16R8)
+  audioBuffer = (uint8_t*) ps_malloc(MAX_AUDIO_BYTES);
+  if (!audioBuffer) {
+    Serial.println("Lỗi: Không đủ PSRAM!");
+    return;
+  }
+
+  // Khởi tạo màn hình
   fspi.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS); 
   tft.init(240, 240, SPI_MODE3);
   tft.setRotation(2);
-  tft.invertDisplay(true); // Cần thiết cho vài loại màn ST7789 để màu ko bị đảo (đen thành trắng)
+  tft.invertDisplay(true); 
   tft.fillScreen(COLOR_BG);
 
   printText("AI Assistant", 42, 100, COLOR_EYE, &FreeSans12pt7b);
-  printText("San sang! Cham de thu am", 10, 130, COLOR_YELLOW, &FreeSans9pt7b);
-  delay(2000);
+  printText("Dang ket noi WiFi...", 40, 130, COLOR_YELLOW, &FreeSans9pt7b);
+
+  // Kết nối WiFi (Dùng điện thoại kết nối vào WiFi "Groq_AI_Setup" nếu chưa cấu hình)
+  WiFiManager wm;
+  if (!wm.autoConnect("Groq_AI_Setup")) {
+    ESP.restart();
+  }
+  
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  
+  tft.fillScreen(COLOR_BG);
+  printText("AI Assistant", 42, 100, COLOR_EYE, &FreeSans12pt7b);
+  printText("WiFi Connected!", 50, 130, COLOR_WHITE, &FreeSans9pt7b);
+  delay(1000);
+
+  // Cấu hình I2S Micro
+  i2s_config_t i2s_mic_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 512,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+  i2s_pin_config_t i2s_mic_pins = {
+    .bck_io_num = I2S_MIC_SCK, .ws_io_num = I2S_MIC_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE, .data_in_num = I2S_MIC_SD
+  };
+  i2s_driver_install(I2S_MIC_PORT, &i2s_mic_config, 0, NULL);
+  i2s_set_pin(I2S_MIC_PORT, &i2s_mic_pins);
+  
+  // Cấu hình I2S Loa ESP8266Audio
+  out = new AudioOutputI2S(I2S_SPK_PORT, 1);
+  out->SetPinout(I2S_SPK_BCLK, I2S_SPK_LRC, I2S_SPK_DIN);
+  mp3 = new AudioGeneratorMP3();
+
   tft.fillScreen(COLOR_BG);
 }
 
@@ -255,31 +338,101 @@ void loop() {
   if (isTouched && currentState == STATE_IDLE) {
     currentState = STATE_LISTENING;
     tft.fillScreen(COLOR_BG);
-    printText("Dang nghe...", 60, 120, COLOR_EYE, &FreeSans12pt7b);
-    delay(200); // Debounce
-  } else if (!isTouched && currentState == STATE_LISTENING) {
-    currentState = STATE_IDLE;
-    forceUIUpdate = true;
-  }
+    printText("Dang nghe...", 60, 100, COLOR_EYE, &FreeSans12pt7b);
+    audioLength = 44; // Dành 44 byte đầu cho Header WAV
+    i2s_zero_dma_buffer(I2S_MIC_PORT);
+  } 
   
   switch (currentState) {
     case STATE_IDLE:
-      drawEyes(); // Vẽ con mắt liếc qua liếc lại + panel nhiệt độ
+      drawEyes();
       delay(20);
       break;
 
-    case STATE_LISTENING:
-      // Vẽ EQ Bars chạy giả lập (chưa có âm thanh thật thì cho chạy random)
-      drawEQBars(random(1000, 4000));
-      delay(50);
+    case STATE_LISTENING: {
+      if (isTouched && audioLength < MAX_AUDIO_BYTES) {
+        size_t bytesRead = 0;
+        int16_t sampleBuffer[256]; // Đọc từng chunk nhỏ
+        i2s_read(I2S_MIC_PORT, &sampleBuffer, sizeof(sampleBuffer), &bytesRead, portMAX_DELAY);
+        
+        // Tính năng lượng để vẽ EQ
+        long energy = 0;
+        for(int i=0; i < bytesRead/2; i++) {
+          energy += abs(sampleBuffer[i]);
+          // Copy vào PSRAM
+          if (audioLength < MAX_AUDIO_BYTES - 1) {
+             uint8_t* bytePtr = (uint8_t*)&sampleBuffer[i];
+             audioBuffer[audioLength++] = bytePtr[0];
+             audioBuffer[audioLength++] = bytePtr[1];
+          }
+        }
+        drawEQBars(energy / (bytesRead/2));
+      } else {
+        // Nhả tay ra -> Bắt đầu gửi
+        currentState = STATE_THINKING;
+        tft.fillScreen(COLOR_BG);
+        printText("Dang suy nghi...", 40, 120, COLOR_YELLOW, &FreeSans12pt7b);
+      }
       break;
+    }
 
-    case STATE_THINKING:
-      // (Để dành cho tương lai)
+    case STATE_THINKING: {
+      // 1. Ghi header WAV
+      createWavHeader(audioBuffer, audioLength - 44);
+
+      // 2. HTTP POST lên Cloudflare
+      HTTPClient http;
+      http.begin(SERVER_URL);
+      http.addHeader("Content-Type", "application/octet-stream");
+      
+      int httpCode = http.POST(audioBuffer, audioLength);
+      
+      if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        
+        // 3. Phân tích JSON JSON
+        JsonDocument doc;
+        deserializeJson(doc, payload);
+        const char* userText = doc["userText"];
+        const char* aiText = doc["aiText"];
+        const char* ttsUrl = doc["ttsUrl"];
+
+        // 4. Vẽ UI Chat Bubbles
+        drawChatUI(userText, aiText);
+
+        // 5. Chuyển sang phát Audio MP3
+        if (ttsUrl) {
+          fileStream = new AudioFileSourceHTTPSStream(ttsUrl);
+          
+          // Đọc biến trở để set âm lượng (0.0 đến 2.0)
+          float vol = analogRead(POT_PIN) / 4095.0 * 2.0;
+          out->SetGain(vol);
+          
+          mp3->begin(fileStream, out);
+          currentState = STATE_SPEAKING;
+        } else {
+          currentState = STATE_IDLE;
+          forceUIUpdate = true;
+        }
+      } else {
+        tft.fillScreen(COLOR_RED);
+        printText("Loi ket noi Server", 30, 120, COLOR_WHITE, &FreeSans9pt7b);
+        delay(2000);
+        currentState = STATE_IDLE;
+        forceUIUpdate = true;
+      }
+      http.end();
       break;
+    }
       
     case STATE_SPEAKING:
-      // (Để dành cho tương lai)
+      if (mp3->isRunning()) {
+        if (!mp3->loop()) mp3->stop();
+      } else {
+        delete fileStream; fileStream = NULL;
+        currentState = STATE_IDLE;
+        forceUIUpdate = true;
+      }
       break;
   }
 }

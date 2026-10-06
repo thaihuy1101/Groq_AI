@@ -40,19 +40,24 @@ export default {
       const llamaData = await llamaRes.json();
       const aiText = llamaData.choices[0].message.content;
 
-      // 3. TTS: Trả về link Google TTS (Hoặc link FPT.AI sau này)
-      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(aiText)}&tl=vi&client=tw-ob`;
-      
-      // Mẫu code FPT.AI (Tạo request lấy link)
-      /*
+      // 3. TTS: Gọi FPT.AI Voice (V5)
       const fptRes = await fetch('https://api.fpt.ai/hmi/tts/v5', {
         method: 'POST',
-        headers: { 'api-key': env.FPT_API_KEY, 'voice': 'banmai', 'speed': '', 'format': 'mp3' },
+        headers: { 
+          'api-key': env.FPT_API_KEY, 
+          'voice': 'banmai', 
+          'speed': '', 
+          'format': 'mp3' 
+        },
         body: aiText
       });
       const fptData = await fptRes.json();
-      ttsUrl = fptData.async; // Lấy link trả về từ FPT
-      */
+      
+      // Nếu API trả về lỗi hoặc không có link async
+      if (!fptData.async) {
+        throw new Error("Lỗi API FPT: " + JSON.stringify(fptData));
+      }
+      const ttsUrl = fptData.async;
 
       // 4. Trả về JSON để ESP32 dễ dàng hiển thị chữ và phát nhạc
       return new Response(JSON.stringify({
