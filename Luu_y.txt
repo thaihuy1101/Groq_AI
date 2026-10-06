@@ -1,0 +1,19 @@
+Để tóm tắt lại toàn bộ "kiếp nạn" này, vấn đề cốt lõi không nằm ở chỗ bo mạch hỏng hay dây lỏng, mà nó nằm ở sự "đụng độ" cực gắt giữa thiết kế phần cứng của màn hình và bộ xử lý của ESP32-S3.
+
+Tóm tắt lại thành 2 Nguyên Nhân Chính và Cách Khắc Phục Chuẩn Chỉ nhất:
+
+1. Kẻ thù số 1: Cái chân CS bị kẹp mass (GND)
+Vấn đề: Màn hình GMT130-V1.0 của fen có 7 chân, nó thiếu mất chân CS (Chip Select) vì nhà sản xuất đã nối chết chân đó xuống mass (GND) để tiết kiệm dây. Điều này có nghĩa là màn hình lúc nào cũng trong trạng thái mở cửa và lắng nghe tín hiệu từ dây Clock (SCK).
+Khi dùng thư viện có sẵn (như TFT_eSPI hoặc Adafruit): Các thư viện này thường gọi lệnh Reset màn hình trước, sau đó mới kích hoạt bộ SPI của ESP32. Khổ nỗi, ngay cái khoảnh khắc ESP32 bật bộ SPI lên, điện áp trên chân Clock bị giật nhẹ một phát (từ rỗng lên 3.3V). Cái màn hình (đang mở cửa sẵn) tưởng đó là 1 bit dữ liệu, thế là toàn bộ chuỗi lệnh 8-bit gửi sau đó bị lệch pha cmnl (màn hình đọc ra rác nên đen thui).
+Cách giải quyết tối thượng: Đảo ngược quy trình!
+BƯỚC 1: Ép ESP32 khởi tạo bộ SPI trước (để chân Clock ổn định hoàn toàn ở mức HIGH).
+BƯỚC 2: Mới kích hoạt chân RST (Reset) của màn hình. Màn hình tỉnh dậy thấy Clock đã im lìm, tín hiệu gửi qua sẽ chuẩn 100% không xước một vạch!
+2. Kẻ thù số 2: Sự kén chọn của ESP32-S3
+Vấn đề: ESP32-S3 là một con chip rất mạnh và quản lý phần cứng cực kỳ nghiêm ngặt. Khi xài thư viện TFT_eSPI mà khai báo chân CS = -1 (không có chân CS), hệ điều hành lõi (ESP-IDF) của chip nó không chịu, nó văng lỗi Hardware Panic (tự sát) làm bo mạch cứ khởi động lại liên tục (hiện tượng đèn xanh chớp 2 lần/s và Serial dừng ở chữ entry...).
+Cách giải quyết tối thượng: Không xài TFT_eSPI nữa! Mình tự viết một đoạn code SPI thuần tuý bằng tay (bảo đảm thứ tự khởi tạo như Cột 1), sau đó "kế thừa" sức mạnh vẽ chữ, vẽ hình của thư viện Adafruit_GFX (như trong đoạn code cuối cùng tui viết cho fen). Đây là cách an toàn, nhanh, mượt và không bao giờ bị Crash!
+📝 BÍ KÍP RÚT TÚI CHO PROJECT SAU:
+Nếu sau này fen mua thêm mấy cái màn hình 7 chân (Không có chân CS) để gắn vô ESP32, chỉ cần nhớ 3 quy tắc vàng:
+
+Đừng cố xài TFT_eSPI nếu không muốn nhức đầu fix lỗi Panic khởi động.
+Luôn cấu hình SPI ở SPI_MODE3 (Clock luôn ở mức cao khi nghỉ).
+Luôn tuân thủ quy tắc: Bật SPI trước $\rightarrow$ Gọi lệnh Reset màn hình sau.

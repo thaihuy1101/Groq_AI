@@ -1,0 +1,8 @@
+name = "esp32-ai-backend"
+main = "index.js"
+compatibility_date = "2024-02-23"
+
+[vars]
+# Thêm API Key của bạn qua CLI thay vì điền thẳng vào đây cho bảo mật:
+# npx wrangler secret put GROQ_API_KEY
+# npx wrangler secret put FPT_API_KEY
